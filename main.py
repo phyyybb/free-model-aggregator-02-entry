@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""free-model-aggregator-02: one server, two client wires, the best free OpenRouter model behind
-every answer.
+"""free-model-aggregator-02, agent/v1: the agent reads one brief, makes its own model call, and
+spawns the aggregator server that serves the two client wires with the best free OpenRouter model
+behind every answer.
 
-A Python 3.13 standard-library-only entry. It reads the brief at $MAKEFUN_PROMPT_FILE (the free
-model list and the six prompts' manifest), builds one catalog, listens on a free port, registers
-with the env at $MAKEFUN_ENV_URL/register, and serves the client's requests:
+This is the agent/v1 entrypoint: the harness runs it as ``python3 -P -s /bot/main.py``. It imports
+the vendored SDK (vendor/makefun_agent.py), reads the trial through af.read_trial(), then — before
+any prompt arrives — makes one real model call of its own (asking the gateway to order the brief's
+free models; that order becomes the tie-break behind each model's rating) and starts the server
+below. The server:
 
   POST /v1/chat/completions   an OpenAI Chat Completions request (JSON or SSE)
   POST /v1/messages           an Anthropic Messages request (JSON or SSE)
@@ -12,14 +15,15 @@ with the env at $MAKEFUN_ENV_URL/register, and serves the client's requests:
                               Anthropic shape for x-api-key
 
 Every request is routed to the strongest free model (highest rating_milli) that meets its
-requirements, with a stable tie-break on the dialable id. A refusal (any 4xx/5xx) fails over to
-the next-best model, and the refusals are reported on the response's `x-makefun-upstream-failures`
-header so the failover column can see them. The client's wire is translated to Chat Completions
-(the only route these ids have) and the gateway's answer is translated back. The server polls
-GET /work and exits 0 when it says done.
+requirements, with the agent's preferred order as a tie-break and the dialable id as the last
+resort. A refusal (any 4xx/5xx) fails over to the next-best model, and the refusals are reported on
+the response's `x-makefun-upstream-failures` header so the failover column can see them. The
+client's wire is translated to Chat Completions (the only route these ids have) and the gateway's
+answer is translated back. The server polls GET /work and exits 0 when it says done.
 
-Every choice is a function of the brief, the request and the gateway answers seen so far — no wall
-clock and no unseeded randomness — so a replay makes the same calls and leaves the same export.
+Every choice is a function of the brief, the request, the trial's seed and the gateway answers seen
+so far — no wall clock and no unseeded randomness — so a replay makes the same calls and leaves the
+same export.
 """
 
 import json
@@ -33,6 +37,13 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# The agent/v1 harness runs this entry as ``python3 -P -s /bot/main.py``: -P keeps the script's own
+# directory off sys.path, so put the vendored SDK's directory on it and import the agent shim.
+_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if _VENDOR_DIR not in sys.path:
+    sys.path.insert(0, _VENDOR_DIR)
+import makefun_agent as af
+
 # ---------------------------------------------------------------- the wire's constants
 
 PROTOCOL_VERSION = 1
@@ -40,11 +51,13 @@ POLL_INTERVAL_SEC = 0.1
 MAX_BODY_BYTES = 8 * 1024 * 1024
 UPSTREAM_TIMEOUT_SEC = 60
 
-ENV_URL = (os.environ.get("MAKEFUN_ENV_URL", "") or "").rstrip("/")
-PROMPT_FILE = os.environ.get("MAKEFUN_PROMPT_FILE", "") or ""
-GATEWAY_URL = (os.environ.get("OPENAI_BASE_URL", "") or "").rstrip("/")
+# These are read from the trial in configure_server() (or, for --list, straight from the env), never
+# at import time: the agent/v1 harness hands them over through af.read_trial().
+ENV_URL = ""
+PROMPT_FILE = ""
+GATEWAY_URL = ""
 # The trial's dummy key; the gateway swaps it for the entrant's own OpenRouter key.
-GATEWAY_KEY = os.environ.get("OPENAI_API_KEY", "") or ""
+GATEWAY_KEY = ""
 
 MODELS_SCHEMA = "free-model-aggregator-02/models/v1"
 PROMPTS_SCHEMA = "free-model-aggregator-02/prompts/v1"
@@ -338,9 +351,10 @@ def requirements_for(body, manifest_requires):
 
 
 def candidate_models(requires):
-    """Free models meeting `requires`, best rating first, then the dialable id as a stable tie-break."""
+    """Free models meeting `requires`, best rating first, then the agent's preferred order (a
+    tie-break the model call chose), then the dialable id as a stable last resort."""
     rows = [m for m in FREE if meets(requires, m) and m["id"] not in DEAD]
-    rows.sort(key=lambda m: (-m["rating_milli"], m["id"]))
+    rows.sort(key=lambda m: (-m["rating_milli"], ROUTING_RANK.get(m["id"], len(FREE) + 1), m["id"]))
     return rows
 
 
@@ -751,10 +765,15 @@ def error_code_of(body_bytes):
 
 # ---------------------------------------------------------------- trial state
 
-BRIEF = read_brief(PROMPT_FILE)
-FREE = free_models(BRIEF)
-CATALOG = build_catalog(FREE)
-SERVED = served_models(FREE)
+# Built once in configure_server(), from the trial's brief, before the server starts.
+BRIEF = None
+FREE = []
+CATALOG = None
+SERVED = []
+# The agent's one model call yields a preferred serving order, kept as a tie-break behind each
+# model's rating; {} (the fallback) sorts by rating then id, the brief's own order.
+ROUTING_RANK = {}
+_TRIAL_SEED = ""
 
 # Permanently unavailable models (a refusal the trial will not recover from) and a per-model 429
 # counter. Both are functions of the gateway answers seen so far, never the wall clock, so a replay
@@ -775,6 +794,128 @@ def next_manifest_requires():
     if index < len(BRIEF["prompts"]):
         return BRIEF["prompts"][index]["requires"]
     return None
+
+
+# ---------------------------------------------------------------- the agent's own model call
+
+
+def best_free_model_id():
+    """The strongest free model on the brief, for the agent's one call (rating, then id)."""
+    rows = sorted(FREE, key=lambda m: (-m["rating_milli"], m["id"]))
+    return rows[0]["id"] if rows else None
+
+
+def routing_prompt():
+    """The routing question, a pure function of the brief and the trial's seed: same seed, same bytes."""
+    rows = sorted(FREE, key=lambda m: m["id"])
+    lines = []
+    for m in rows:
+        caps = [c for c in ("tools", "vision", "json") if m[c]]
+        lines.append(
+            "%s | rating=%d | context=%s | %s"
+            % (
+                m["id"],
+                m["rating_milli"],
+                "null" if m["context_length"] is None else str(m["context_length"]),
+                ",".join(caps) if caps else "none",
+            )
+        )
+    return (
+        "You route prompts for a free-model aggregator. Given the free models below (id, house "
+        "rating where higher is stronger, context length, capabilities), return ONLY a JSON array "
+        "of their ids in your preferred serving order, best first. Reply with the JSON array and "
+        "nothing else.\n"
+        "trial seed: %s\n%s" % (_TRIAL_SEED, "\n".join(lines))
+    )
+
+
+def first_json_array(text):
+    """The first JSON array in `text`, or None; string contents and nesting are honoured."""
+    start = text.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start : i + 1])
+                except Exception:
+                    return None
+                return value if isinstance(value, list) else None
+        i += 1
+    return None
+
+
+def extract_model_ids(answer):
+    """The model ids a Chat Completions answer's first message names, in order; [] when unusable."""
+    if not is_record(answer):
+        return []
+    choices = answer.get("choices")
+    if not isinstance(choices, list) or not choices or not is_record(choices[0]):
+        return []
+    message = choices[0].get("message")
+    if not is_record(message):
+        return []
+    content = message.get("content")
+    text = content if isinstance(content, str) else ""
+    if text == "":
+        return []
+    value = first_json_array(text)
+    if value is None:
+        return []
+    return [v for v in value if isinstance(v, str) and v != ""]
+
+
+def build_routing_rank(trial):
+    """Make the agent's one real model call and keep its answer as ROUTING_RANK (a tie-break).
+
+    The call is a completion (a real model answer, not a listing), so the trial's "the agent made no
+    model call" check sees one. The request is a function of the brief and the trial's seed alone,
+    and the decision is made once, so a replay records the same call and the gateway answers it the
+    same way. A refusal or an unusable answer falls back to {} (rating, then id), deterministically.
+    """
+    global ROUTING_RANK
+    model_id = best_free_model_id()
+    if model_id is None:
+        ROUTING_RANK = {}
+        return
+    body = {
+        "model": model_id,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": routing_prompt()}],
+    }
+    try:
+        answer = af.OpenAI(trial).chat(body)
+    except af.LlmError as err:
+        log("routing call answered %s %s: using the brief's ratings alone" % (err.status, err.type or ""))
+        ROUTING_RANK = {}
+        return
+    order = extract_model_ids(answer)
+    valid = {m["id"] for m in FREE}
+    seen = set()
+    preference = []
+    for mid in order:
+        if mid in valid and mid not in seen:
+            seen.add(mid)
+            preference.append(mid)
+    ROUTING_RANK = {mid: i for i, mid in enumerate(preference)}
+    log("routing preference from the model: %d ids" % len(preference))
 
 
 # ---------------------------------------------------------------- the HTTP server
@@ -1061,10 +1202,6 @@ def stop(*_):
 def start():
     if BRIEF["error"] is not None:
         log(BRIEF["error"])
-    if "--list" in sys.argv[1:]:
-        sys.stdout.write(json.dumps(CATALOG, separators=(",", ":"), ensure_ascii=False) + "\n")
-        sys.stdout.flush()
-        return
     if ENV_URL == "":
         raise RuntimeError("MAKEFUN_ENV_URL is not set")
     if chat_completions_url() == "":
@@ -1085,7 +1222,43 @@ def start():
         server.server_close()
 
 
+def configure_server(trial):
+    """Point the server's module globals at the trial the SDK read (and log any brief error)."""
+    global ENV_URL, PROMPT_FILE, GATEWAY_URL, GATEWAY_KEY, BRIEF, FREE, CATALOG, SERVED, _TRIAL_SEED
+    ENV_URL = trial.env_url
+    PROMPT_FILE = trial.prompt_file
+    GATEWAY_URL = trial.openai.base_url
+    GATEWAY_KEY = trial.openai.api_key
+    _TRIAL_SEED = trial.seed
+    BRIEF = read_brief(PROMPT_FILE)
+    FREE = free_models(BRIEF)
+    CATALOG = build_catalog(FREE)
+    SERVED = served_models(FREE)
+
+
+def run_list():
+    """`--list`: print the catalog the register body carries, byte for byte, and exit before any
+    trial or server starts (works with or without the agent/v1 environment)."""
+    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE", "") or ""
+    brief = read_brief(prompt_file)
+    if brief["error"] is not None:
+        log(brief["error"])
+    catalog = build_catalog(free_models(brief))
+    sys.stdout.write(json.dumps(catalog, separators=(",", ":"), ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
 def main():
+    if "--list" in sys.argv[1:]:
+        run_list()
+        return 0
+    try:
+        trial = af.read_trial()
+    except af.TrialConfigError as err:
+        log("fatal: %r" % err)
+        return 1
+    configure_server(trial)
+    build_routing_rank(trial)
     try:
         start()
         return 0
