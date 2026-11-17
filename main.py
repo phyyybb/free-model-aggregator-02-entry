@@ -1,155 +1,109 @@
-#!/usr/bin/env python3
-"""free-model-aggregator-02, agent/v1: the agent reads one brief, makes its own model call, and
-spawns the aggregator server that serves the two client wires with the best free OpenRouter model
-behind every answer.
-
-This is the agent/v1 entrypoint: the harness runs it as ``python3 -P -s /bot/main.py``. It imports
-the vendored SDK (vendor/makefun_agent.py), reads the trial through af.read_trial(), then — before
-any prompt arrives — makes one real model call of its own (asking the gateway to order the brief's
-free models; that order becomes the tie-break behind each model's rating) and starts the server
-below. The server:
-
-  POST /v1/chat/completions   an OpenAI Chat Completions request (JSON or SSE)
-  POST /v1/messages           an Anthropic Messages request (JSON or SSE)
-  GET  /v1/models             OpenAI shape for Authorization: Bearer,
-                              Anthropic shape for x-api-key
-
-Every request is routed to the strongest free model (highest rating_milli) that meets its
-requirements, with the agent's preferred order as a tie-break and the dialable id as the last
-resort. A refusal (any 4xx/5xx) fails over to the next-best model, and the refusals are reported on
-the response's `x-makefun-upstream-failures` header so the failover column can see them. The
-client's wire is translated to Chat Completions (the only route these ids have) and the gateway's
-answer is translated back. The server polls GET /work and exits 0 when it says done.
-
-Every choice is a function of the brief, the request, the trial's seed and the gateway answers seen
-so far — no wall clock and no unseeded randomness — so a replay makes the same calls and leaves the
-same export.
-"""
+# free-model-aggregator-02 entry: one server, two client wires, a real free model behind every
+# answer, and one mandatory agent model call that plans routing. Python 3.13, standard library only.
+#
+# A trial runs this as `python3 -P -s /bot/main.py` with PYTHONHASHSEED=0. -P keeps the script's own
+# directory off sys.path and -s keeps user site-packages off it, so everything lives in this one file
+# plus the vendored agent shim (vendor/makefun_agent.py), which this file puts on sys.path itself.
+#
+# WHAT A TRIAL GIVES YOU
+#   MAKEFUN_PROMPT_FILE   the brief: the free model list (id, rating, capabilities) and the six prompts'
+#                         manifest, in the order the env sends them.
+#   MAKEFUN_ENV_URL       the env: POST /register, GET /work.
+#   OPENAI_BASE_URL       the gateway (OpenAI Chat Completions): the only route the free models have.
+#   OPENAI_API_KEY        the trial's dummy key, which the gateway swaps for the entrant's OpenRouter key.
+#
+# THE SERVER
+#   1. reads the trial and the brief, and makes ONE deterministic agent call through the gateway to plan
+#      which model serves simple (no-tools/no-json/no-vision) prompts;
+#   2. listens on 0.0.0.0 at a free port and POSTs {protocol_version, port, catalog} to /register;
+#   3. serves GET /v1/models (OpenAI shape for Authorization, Anthropic shape for x-api-key),
+#      POST /v1/chat/completions and POST /v1/messages, JSON and server-sent events;
+#   4. answers each prompt by dialling the highest-rated free model that meets its requirements through
+#      the gateway, failing over to the next model on a refusal and reporting the trail in
+#      x-makefun-upstream-failures;
+#   5. polls GET /work and exits 0 when it says done.
+#
+# THE MODEL RULE
+#   Every response's `model` field names the model this entry really dialled: the house records every
+#   gateway call and scores the model that actually answered. The gateway's Chat Completions answer
+#   spells a free model without the `openrouter/` prefix, so every relayed answer and every streamed
+#   chunk gets the dialled id put back.
+#
+# DETERMINISM
+#   Everything a request carries is a pure function of the brief, the client's requests and the
+#   gateway's answers seen so far: no wall clock, no unseeded randomness. The planning call's body is
+#   fixed, and its answer (replayed identically on the replay pass) only ever promotes a model that is
+#   at least as highly rated as the deterministic best, so the routing table is the same both passes.
 
 import json
+import math
 import os
 import signal
 import sys
 import threading
 import time
+import traceback
 import urllib.error
-import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
-# The agent/v1 harness runs this entry as ``python3 -P -s /bot/main.py``: -P keeps the script's own
-# directory off sys.path, so put the vendored SDK's directory on it and import the agent shim.
-_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-if _VENDOR_DIR not in sys.path:
-    sys.path.insert(0, _VENDOR_DIR)
-import makefun_agent as af
+# The agent/v1 shim vendored beside this file: read_trial() and the gateway's model clients. -P keeps
+# /bot off sys.path, so this file puts the vendor directory there itself before importing.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vendor'))
+import makefun_agent as af  # noqa: E402
 
-# ---------------------------------------------------------------- the wire's constants
+# ---------------------------------------------------------------- constants
 
 PROTOCOL_VERSION = 1
 POLL_INTERVAL_SEC = 0.1
 MAX_BODY_BYTES = 8 * 1024 * 1024
-UPSTREAM_TIMEOUT_SEC = 60
 
-# These are read from the trial in configure_server() (or, for --list, straight from the env), never
-# at import time: the agent/v1 harness hands them over through af.read_trial().
-ENV_URL = ""
-PROMPT_FILE = ""
-GATEWAY_URL = ""
-# The trial's dummy key; the gateway swaps it for the entrant's own OpenRouter key.
-GATEWAY_KEY = ""
+MODELS_SCHEMA = 'free-model-aggregator-02/models/v1'
+PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1'
+SCHEMA_PREFIX = 'free-model-aggregator-02/'
 
-MODELS_SCHEMA = "free-model-aggregator-02/models/v1"
-PROMPTS_SCHEMA = "free-model-aggregator-02/prompts/v1"
-SCHEMA_PREFIX = "free-model-aggregator-02/"
+# The provider's public endpoint (the catalog names this, never the gateway's trial-local address).
+OPENROUTER_PUBLIC_BASE = 'https://' + 'openrouter' + '.ai/api/v1'
+OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY'
 
-# The public base URL of the provider these free models belong to; never dialled (the gateway is
-# dialled at $OPENAI_BASE_URL), only written into the catalog, which is part of the replay's export.
-OPENROUTER_PUBLIC_BASE = "https://" + "openrouter" + ".ai/api/v1"
-OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
-
-# Fixed, clock-free timestamps so GET /v1/models is deterministic on every pass.
+# Fixed timestamps for the model listings: nothing in a reply reads the clock.
 FIXED_OPENAI_CREATED = 1767225600
-FIXED_ANTHROPIC_CREATED_AT = "2026-01-01T00:00:00Z"
+FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z'
 
-LEGAL_ANTHROPIC_STOP = ("end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal", "pause_turn")
+# The output cap added when a request names none (the gateway refuses a call without one).
+DEFAULT_MAX_TOKENS = 512
+# The gateway refuses an output cap over this; clamp to keep a prompt servable.
+MAX_ALLOWED_TOKENS = 8192
 
-# A refusal status the model will not recover from within the trial: never dial it again.
-PERMANENT_REFUSAL_STATUS = (400, 401, 402, 403, 404, 408, 409)
-# A 429 is transient; give a model this many refusals before it is parked for the rest of the trial.
-MAX_429_BEFORE_DEAD = 2
-
-
-# ---------------------------------------------------------------- small helpers
+# ---------------------------------------------------------------- small type checks
 
 
-def is_record(value):
-    return isinstance(value, dict)
-
-
-def is_number(value):
+def is_number(value: object) -> bool:
+    """A JSON number: an int or a float, never a bool."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def number_or_null(value):
-    return value if is_number(value) else None
+def string_of(value: object) -> str:
+    return value if isinstance(value, str) else ''
 
 
-def number_or_zero(value):
+def number_or_null(value: object) -> int | float | None:
+    return value if is_number(value) and math.isfinite(value) else None
+
+
+def number_or_zero(value: object) -> int | float:
     return value if is_number(value) else 0
 
 
-def string_of(value):
-    return value if isinstance(value, str) else ""
+def bool_or_null(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
-def text_of(content):
-    """The text of a string or of a block array's text blocks; '' otherwise."""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts = []
-    for block in content:
-        if is_record(block) and block.get("type") == "text" and isinstance(block.get("text"), str):
-            parts.append(block["text"])
-    return "\n".join(parts)
+# ---------------------------------------------------------------- the brief's documents
 
 
-def arguments_of(value):
-    """A tool call's arguments as an object, or {} when it is not one."""
-    if is_record(value):
-        return value
-    if isinstance(value, str) and value.strip() != "":
-        try:
-            parsed = json.loads(value)
-        except Exception:
-            return {}
-        if is_record(parsed):
-            return parsed
-    return {}
-
-
-def tool_result_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text = text_of(content)
-        return text if text != "" else json.dumps(content, separators=(",", ":"), ensure_ascii=False)
-    if content is None:
-        return ""
-    return json.dumps(content, separators=(",", ":"), ensure_ascii=False)
-
-
-def log(message):
-    sys.stderr.write("aggregator: %s\n" % message)
-    sys.stderr.flush()
-
-
-# ---------------------------------------------------------------- the brief
-
-
-def object_end(text, start):
+def object_end(text: str, start: int) -> int:
     """The index of the `}` closing the object that opens at `start`, or -1; string contents skipped."""
     depth = 0
     in_string = False
@@ -158,16 +112,16 @@ def object_end(text, start):
     while i < n:
         ch = text[i]
         if in_string:
-            if ch == "\\":
+            if ch == '\\':
                 i += 2
                 continue
             if ch == '"':
                 in_string = False
         elif ch == '"':
             in_string = True
-        elif ch == "{":
+        elif ch == '{':
             depth += 1
-        elif ch == "}":
+        elif ch == '}':
             depth -= 1
             if depth == 0:
                 return i
@@ -175,1023 +129,1121 @@ def object_end(text, start):
     return -1
 
 
-def documents_in(text):
+def documents_in(text: str) -> list[dict]:
     """Every JSON object in `text` that carries a string `schema`, in the order they appear."""
-    out = []
-    start = text.find("{")
+    out: list[dict] = []
+    start = text.find('{')
     while start != -1:
         end = object_end(text, start)
         if end != -1:
             try:
                 value = json.loads(text[start : end + 1])
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 value = None
-            if is_record(value) and isinstance(value.get("schema"), str) and SCHEMA_PREFIX in string_of(value.get("schema")):
+            if isinstance(value, dict) and isinstance(value.get('schema'), str):
                 out.append(value)
-        start = text.find("{", start + 1)
+        start = text.find('{', start + 1)
     return out
 
 
-def model_of(value):
-    if not is_record(value):
-        return None
-    raw = string_of(value.get("id"))
-    if raw == "":
-        raw = string_of(value.get("model"))
-    if raw == "":
-        return None
-    provider = string_of(value.get("provider")) or "openrouter"
-    model_id = ("openrouter/" + raw) if provider == "openrouter" and not raw.lower().startswith("openrouter/") else raw
-    display_name = string_of(value.get("display_name")) or raw
-    return {
-        "id": model_id,
-        "provider": provider,
-        "display_name": display_name,
-        "rating_milli": number_or_zero(value.get("rating_milli")),
-        "context_length": number_or_null(value.get("context_length")),
-        "tools": value.get("tools") is True,
-        "vision": value.get("vision") is True,
-        "json": value.get("json") is True,
-        "free": value.get("free") is not False,
-    }
-
-
-def prompt_of(value):
-    if not is_record(value):
-        return None
-    pid = string_of(value.get("id"))
-    if pid == "":
-        return None
-    requires = value.get("requires") if is_record(value.get("requires")) else {}
-    req = {
-        "tools": requires.get("tools") is True,
-        "vision": requires.get("vision") is True,
-        "json": requires.get("json") is True,
-    }
-    if is_number(requires.get("min_context")):
-        req["min_context"] = requires["min_context"]
-    return {
-        "id": pid,
-        "api": "anthropic" if value.get("api") == "anthropic" else "openai",
-        "stream": value.get("stream") is True,
-        "weight": 2 if value.get("weight") == 2 else 1,
-        "requires": req,
-    }
-
-
-def read_brief(path):
-    brief = {"models": [], "prompts": [], "error": None}
-    if path == "":
-        brief["error"] = "MAKEFUN_PROMPT_FILE is not set"
-        return brief
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError as err:
-        brief["error"] = "cannot read %s: %s" % (path, err)
-        return brief
-    docs = documents_in(text)
-    models_doc = next((d for d in docs if d.get("schema") == MODELS_SCHEMA and isinstance(d.get("models"), list)), None)
-    if models_doc is None:
-        brief["error"] = "the brief holds no %s document" % MODELS_SCHEMA
-        return brief
-    brief["models"] = [m for m in (model_of(v) for v in models_doc["models"]) if m is not None]
-    prompts_doc = next((d for d in docs if d.get("schema") == PROMPTS_SCHEMA and isinstance(d.get("prompts"), list)), None)
-    if prompts_doc is not None:
-        brief["prompts"] = [p for p in (prompt_of(v) for v in prompts_doc["prompts"]) if p is not None]
-    return brief
-
-
-def free_models(brief):
-    return [m for m in brief["models"] if m["free"]]
-
-
-def build_catalog(models):
-    seen = set()
-    rows = []
-    for model in models:
-        mid = model["id"]
-        if not model["free"] or mid in seen:
+def array_document(docs: list[dict], keys: tuple[str, ...]) -> tuple[dict, str] | None:
+    """The first document under this contest's prefix that carries one of `keys` as an array."""
+    for doc in docs:
+        schema = string_of(doc.get('schema'))
+        if SCHEMA_PREFIX not in schema:
             continue
-        seen.add(mid)
-        rows.append({"id": mid, "free": True, "context_length": model["context_length"]})
-    rows.sort(key=lambda r: r["id"])
-    if not rows:
-        return {"providers": []}
+        for key in keys:
+            if isinstance(doc.get(key), list):
+                return doc, key
+    return None
+
+
+def model_of(value: object) -> dict | None:
+    """One model row. A free row is routed as the gateway spells its id (`openrouter/<upstream>`)."""
+    if not isinstance(value, dict):
+        return None
+    raw = string_of(value.get('id'))
+    if raw == '':
+        raw = string_of(value.get('model'))
+    if raw == '':
+        return None
+    named = string_of(value.get('provider'))
+    if named == '':
+        named = string_of(value.get('wire'))
+    model_id = f'openrouter/{raw}' if named == 'openrouter' and not raw.lower().startswith('openrouter/') else raw
+    display_name = string_of(value.get('display_name'))
+    rating = number_or_null(value.get('rating_milli'))
     return {
-        "providers": [
+        'id': model_id,
+        'provider': named if named != '' else 'openrouter',
+        'display_name': display_name if display_name != '' else raw,
+        'rating_milli': rating if rating is not None else 0,
+        'context_length': number_or_null(value.get('context_length')),
+        'tools': bool_or_null(value.get('tools')),
+        'vision': bool_or_null(value.get('vision')),
+        'json': bool_or_null(value.get('json')),
+        'free': value.get('free') is not False,
+    }
+
+
+def prompt_of(value: object) -> dict | None:
+    """One prompt row: its id, api, streaming flag, weight and the requirements a model must meet."""
+    if not isinstance(value, dict):
+        return None
+    prompt_id = string_of(value.get('id'))
+    if prompt_id == '':
+        return None
+    requires = value.get('requires') if isinstance(value.get('requires'), dict) else {}
+    return {
+        'id': prompt_id,
+        'api': 'anthropic' if value.get('api') == 'anthropic' else 'openai',
+        'stream': value.get('stream') is True,
+        'weight': 2 if value.get('weight') == 2 else 1,
+        'requires': {
+            **({'tools': True} if requires.get('tools') is True else {}),
+            **({'vision': True} if requires.get('vision') is True else {}),
+            **({'json': True} if requires.get('json') is True else {}),
+            **({'min_context': requires['min_context']} if is_number(requires.get('min_context')) and math.isfinite(requires['min_context']) else {}),
+        },
+    }
+
+
+def read_brief(text: str) -> dict:
+    """The brief's two documents, found under this contest's schema prefix.
+
+    Returns {"models": [...], "prompts": [...], "error": <string or None>}. The brief's prose is never
+    parsed: each document is found by its `schema` member.
+    """
+    if text == '':
+        return {'models': [], 'prompts': [], 'error': 'MAKEFUN_PROMPT_FILE is not set'}
+    docs = documents_in(text)
+    models_doc = array_document(docs, ('models', 'ratings'))
+    if models_doc is None:
+        return {'models': [], 'prompts': [], 'error': f'the brief holds no {MODELS_SCHEMA} document'}
+    models = [m for m in (model_of(v) for v in models_doc[0][models_doc[1]]) if m is not None]
+    prompts_doc = array_document(docs, ('prompts', 'manifest'))
+    if prompts_doc is None:
+        return {'models': models, 'prompts': [], 'error': f'the brief holds no {PROMPTS_SCHEMA} document'}
+    prompts = [p for p in (prompt_of(v) for v in prompts_doc[0][prompts_doc[1]]) if p is not None]
+    return {'models': models, 'prompts': prompts, 'error': None}
+
+
+def read_brief_file(path: str) -> dict:
+    """read_brief for the `--list` path, which runs outside a trial and reads the file directly."""
+    if path == '':
+        return read_brief('')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return read_brief(handle.read())
+    except OSError as err:
+        return {'models': [], 'prompts': [], 'error': f'cannot read {path}: {err}'}
+
+
+def free_models(brief: dict) -> list[dict]:
+    """The models this entry may serve: the brief's free ones, in the brief's order."""
+    return [m for m in brief['models'] if m['free']]
+
+
+def capabilities_of(model: dict) -> dict:
+    return {
+        'context_length': model['context_length'],
+        'tools': model['tools'],
+        'vision': model['vision'],
+        'json': model['json'],
+    }
+
+
+def meets_requirements(requires: dict, caps: dict) -> bool:
+    """Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one."""
+    if requires.get('tools') is True and caps['tools'] is not True:
+        return False
+    if requires.get('vision') is True and caps['vision'] is not True:
+        return False
+    if requires.get('json') is True and caps['json'] is not True:
+        return False
+    min_context = requires.get('min_context')
+    if min_context is not None and (caps['context_length'] is None or caps['context_length'] < min_context):
+        return False
+    return True
+
+
+def build_catalog(brief: dict) -> dict:
+    """The catalog the brief's free model list makes: one provider, its models.
+
+    The base_url is the provider's public endpoint, never the gateway's trial-local address (the
+    gateway's origin differs between a live pass and its replay, and the catalog is part of the state
+    export a replay must reproduce byte for byte). The catalog column compares model-id sets only, so it
+    lists exactly the fourteen free ids, once each, in the brief's order.
+    """
+    seen: set[str] = set()
+    models: list[dict] = []
+    for model in brief['models']:
+        model_id = model['id']
+        if not model['free'] or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append({'id': model_id, 'free': True, 'context_length': model['context_length']})
+    if not models:
+        return {'providers': []}
+    return {
+        'providers': [
             {
-                "id": "openrouter",
-                "base_url": OPENROUTER_PUBLIC_BASE,
-                "key_env": OPENROUTER_KEY_ENV,
-                "wire": "openai",
-                "models": rows,
+                'id': 'openrouter',
+                'base_url': OPENROUTER_PUBLIC_BASE,
+                'key_env': OPENROUTER_KEY_ENV,
+                'wire': 'openai',
+                'models': models,
             }
         ]
     }
 
 
-def served_models(models):
-    out = []
-    for model in models:
-        if model["free"]:
-            out.append({"id": model["id"], "provider": model["provider"], "display_name": model["display_name"]})
-    out.sort(key=lambda m: m["id"])
-    return out
+# ---------------------------------------------------------------- the client wires and the model field
 
 
-# ---------------------------------------------------------------- requirements and routing
+def openai_model_list(models: list[dict]) -> dict:
+    """GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape."""
+    return {
+        'object': 'list',
+        'data': [{'id': m['id'], 'object': 'model', 'created': FIXED_OPENAI_CREATED, 'owned_by': m['provider']} for m in models],
+    }
 
 
-def meets(requires, caps):
-    if requires.get("tools") and not caps["tools"]:
-        return False
-    if requires.get("vision") and not caps["vision"]:
-        return False
-    if requires.get("json") and not caps["json"]:
-        return False
-    min_context = requires.get("min_context")
-    if min_context is not None and (caps["context_length"] is None or caps["context_length"] < min_context):
-        return False
-    return True
+def anthropic_model_list(models: list[dict]) -> dict:
+    """GET /v1/models on an Anthropic-shaped request (an x-api-key header): Anthropic's model list shape."""
+    return {
+        'data': [{'type': 'model', 'id': m['id'], 'display_name': m['display_name'], 'created_at': FIXED_ANTHROPIC_CREATED_AT} for m in models],
+        'has_more': False,
+    }
 
 
-def has_json_mode(body):
-    fmt = body.get("response_format")
-    return is_record(fmt) and fmt.get("type") in ("json_object", "json_schema")
+def anthropic_error(error_type: str, message: str) -> dict:
+    return {'type': 'error', 'error': {'type': error_type, 'message': message}}
 
 
-def body_has_tools(body):
-    return isinstance(body.get("tools"), list) and len(body["tools"]) > 0
+def openai_error(message: str, error_type: str, code: str | None) -> dict:
+    return {'error': {'message': message, 'type': error_type, 'code': code}}
 
 
-def body_has_images(body):
-    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
-    for message in messages:
-        if not is_record(message) or not isinstance(message.get("content"), list):
-            continue
-        for block in message["content"]:
-            if is_record(block) and block.get("type") in ("image", "image_url"):
-                return True
-    return False
+def text_of(content: object) -> str:
+    """The text of a string or of a block array's text blocks; '' when there is none."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    parts = [b['text'] for b in content if isinstance(b, dict) and b.get('type') == 'text' and isinstance(b.get('text'), str)]
+    return '\n'.join(parts)
 
 
-def requirements_for(body, manifest_requires):
-    """The requirements of the request now arriving: the brief's row by arrival order, united with
-    the request body's own (so a body that asks for JSON mode, tools or an image is never under-
-    required even when the brief's manifest is short)."""
-    req = dict(manifest_requires) if manifest_requires else {}
-    if has_json_mode(body):
-        req["json"] = True
-    if body_has_tools(body):
-        req["tools"] = True
-    if body_has_images(body):
-        req["vision"] = True
-    return req
+def part_of(block: dict) -> dict | None:
+    """One Anthropic content block as an OpenAI content part: text or an inline image; None for the rest."""
+    if block.get('type') == 'text' and isinstance(block.get('text'), str):
+        return {'type': 'text', 'text': block['text']}
+    source = block.get('source')
+    if block.get('type') == 'image' and isinstance(source, dict):
+        if source.get('type') == 'base64' and isinstance(source.get('data'), str):
+            media = source['media_type'] if isinstance(source.get('media_type'), str) else 'image/png'
+            return {'type': 'image_url', 'image_url': {'url': f'data:{media};base64,{source["data"]}'}}
+        if source.get('type') == 'url' and isinstance(source.get('url'), str):
+            return {'type': 'image_url', 'image_url': {'url': source['url']}}
+    return None
 
 
-def candidate_models(requires):
-    """Free models meeting `requires`, best rating first, then the agent's preferred order (a
-    tie-break the model call chose), then the dialable id as a stable last resort."""
-    rows = [m for m in FREE if meets(requires, m) and m["id"] not in DEAD]
-    rows.sort(key=lambda m: (-m["rating_milli"], ROUTING_RANK.get(m["id"], len(FREE) + 1), m["id"]))
-    return rows
+def tool_result_text(content: object) -> str:
+    """A tool_result block's content as text: its text blocks, or its JSON when it holds something else."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text = text_of(content)
+        return text if text != '' else json.dumps(content, separators=(',', ':'), ensure_ascii=False)
+    if content is None:
+        return ''
+    return json.dumps(content, separators=(',', ':'), ensure_ascii=False)
 
 
-# ---------------------------------------------------------------- request translation
+def arguments_of(value: object) -> dict:
+    """A tool call's arguments as an object: the gateway's JSON string, or {} when it is not one."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip() != '':
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
 
 
-def anthropic_to_openai(body, model):
-    """An Anthropic Messages request as an OpenAI Chat Completions request naming `model`."""
-    messages = []
-    system = text_of(body.get("system"))
-    if system != "":
-        messages.append({"role": "system", "content": system})
-    source = body.get("messages") if isinstance(body.get("messages"), list) else []
+def stop_reason_of(finish: object) -> str:
+    """OpenAI's finish_reason as Anthropic's stop_reason."""
+    if finish == 'length':
+        return 'max_tokens'
+    if finish == 'tool_calls' or finish == 'function_call':
+        return 'tool_use'
+    if finish == 'content_filter':
+        return 'refusal'
+    return 'end_turn'
+
+
+def anthropic_to_openai(body: dict, model: str) -> dict:
+    """An Anthropic Messages request as an OpenAI Chat Completions request that names `model`."""
+    messages: list[dict] = []
+    system = text_of(body.get('system'))
+    if system != '':
+        messages.append({'role': 'system', 'content': system})
+    source = body.get('messages') if isinstance(body.get('messages'), list) else []
     for raw in source:
-        if not is_record(raw):
+        if not isinstance(raw, dict):
             continue
-        assistant = raw.get("role") == "assistant"
-        content = raw.get("content")
+        assistant = raw.get('role') == 'assistant'
+        content = raw.get('content')
         if isinstance(content, str):
-            messages.append({"role": "assistant" if assistant else "user", "content": content})
+            messages.append({'role': 'assistant' if assistant else 'user', 'content': content})
             continue
         if not isinstance(content, list):
             continue
         if assistant:
-            tool_calls = []
+            tool_calls: list[dict] = []
             for block in content:
-                if not is_record(block) or block.get("type") != "tool_use":
+                if not isinstance(block, dict) or block.get('type') != 'tool_use':
                     continue
                 tool_calls.append(
                     {
-                        "id": block["id"] if isinstance(block.get("id"), str) else "",
-                        "type": "function",
-                        "function": {
-                            "name": block["name"] if isinstance(block.get("name"), str) else "",
-                            "arguments": json.dumps(
-                                block["input"] if is_record(block.get("input")) else {},
-                                separators=(",", ":"),
-                                ensure_ascii=False,
-                            ),
+                        'id': block['id'] if isinstance(block.get('id'), str) else '',
+                        'type': 'function',
+                        'function': {
+                            'name': block['name'] if isinstance(block.get('name'), str) else '',
+                            'arguments': json.dumps(block['input'] if isinstance(block.get('input'), dict) else {}, separators=(',', ':'), ensure_ascii=False),
                         },
                     }
                 )
             text = text_of(content)
-            message = {"role": "assistant", "content": text if text != "" else None}
+            message: dict = {'role': 'assistant', 'content': text if text != '' else None}
             if tool_calls:
-                message["tool_calls"] = tool_calls
+                message['tool_calls'] = tool_calls
             messages.append(message)
             continue
-        parts = []
+        parts: list[dict] = []
         for block in content:
-            if not is_record(block):
+            if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_result":
+            if block.get('type') == 'tool_result':
                 messages.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": block["tool_use_id"] if isinstance(block.get("tool_use_id"), str) else "",
-                        "content": tool_result_text(block.get("content")),
+                        'role': 'tool',
+                        'tool_call_id': block['tool_use_id'] if isinstance(block.get('tool_use_id'), str) else '',
+                        'content': tool_result_text(block.get('content')),
                     }
                 )
                 continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                parts.append({"type": "text", "text": block["text"]})
-            elif block.get("type") == "image" and is_record(block.get("source")):
-                src = block["source"]
-                url = None
-                if src.get("type") == "base64" and isinstance(src.get("data"), str):
-                    media = src.get("media_type") if isinstance(src.get("media_type"), str) else "image/png"
-                    url = "data:%s;base64,%s" % (media, src["data"])
-                elif src.get("type") == "url" and isinstance(src.get("url"), str):
-                    url = src["url"]
-                if url is not None:
-                    parts.append({"type": "image_url", "image_url": {"url": url}})
+            part = part_of(block)
+            if part is not None:
+                parts.append(part)
         if parts:
-            messages.append({"role": "user", "content": parts})
+            messages.append({'role': 'user', 'content': parts})
 
-    out = {"model": model, "messages": messages}
-    if is_number(body.get("max_tokens")):
-        out["max_tokens"] = body["max_tokens"]
-    if is_number(body.get("temperature")):
-        out["temperature"] = body["temperature"]
-    if is_number(body.get("top_p")):
-        out["top_p"] = body["top_p"]
-    stop_sequences = body.get("stop_sequences")
-    if isinstance(stop_sequences, list) and len(stop_sequences) > 0:
-        out["stop"] = stop_sequences
-    tools = body.get("tools")
-    if isinstance(tools, list):
-        converted = []
-        for raw_tool in tools:
-            if not is_record(raw_tool) or not isinstance(raw_tool.get("name"), str):
+    out: dict = {'model': model, 'messages': messages}
+    if is_number(body.get('max_tokens')):
+        out['max_tokens'] = body['max_tokens']
+    if is_number(body.get('temperature')):
+        out['temperature'] = body['temperature']
+    if is_number(body.get('top_p')):
+        out['top_p'] = body['top_p']
+    if isinstance(body.get('stop_sequences'), list) and len(body['stop_sequences']) > 0:
+        out['stop'] = body['stop_sequences']
+    if isinstance(body.get('tools'), list):
+        tools: list[dict] = []
+        for raw in body['tools']:
+            if not isinstance(raw, dict) or not isinstance(raw.get('name'), str):
                 continue
-            converted.append(
+            tools.append(
                 {
-                    "type": "function",
-                    "function": {
-                        "name": raw_tool["name"],
-                        "description": raw_tool["description"] if isinstance(raw_tool.get("description"), str) else "",
-                        "parameters": raw_tool["input_schema"] if is_record(raw_tool.get("input_schema")) else {"type": "object", "properties": {}},
+                    'type': 'function',
+                    'function': {
+                        'name': raw['name'],
+                        'description': raw['description'] if isinstance(raw.get('description'), str) else '',
+                        'parameters': raw['input_schema'] if isinstance(raw.get('input_schema'), dict) else {'type': 'object', 'properties': {}},
                     },
                 }
             )
-        if converted:
-            out["tools"] = converted
-    choice = body.get("tool_choice")
-    if is_record(choice):
-        if choice.get("type") == "auto":
-            out["tool_choice"] = "auto"
-        elif choice.get("type") == "any":
-            out["tool_choice"] = "required"
-        elif choice.get("type") == "tool" and isinstance(choice.get("name"), str):
-            out["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
-    if body.get("stream") is True:
-        out["stream"] = True
-        out["stream_options"] = {"include_usage": True}
+        if tools:
+            out['tools'] = tools
+    choice = body.get('tool_choice')
+    if isinstance(choice, dict):
+        if choice.get('type') == 'auto':
+            out['tool_choice'] = 'auto'
+        elif choice.get('type') == 'any':
+            out['tool_choice'] = 'required'
+        elif choice.get('type') == 'tool' and isinstance(choice.get('name'), str):
+            out['tool_choice'] = {'type': 'function', 'function': {'name': choice['name']}}
+    if body.get('stream') is True:
+        out['stream'] = True
+        out['stream_options'] = {'include_usage': True}
     return out
 
 
-def openai_to_openai(body, model):
-    out = dict(body)
-    out["model"] = model
-    if out.get("stream") is True:
-        options = dict(out["stream_options"]) if is_record(out.get("stream_options")) else {}
-        options["include_usage"] = True
-        out["stream_options"] = options
-    return out
-
-
-# ---------------------------------------------------------------- stop reason mappings
-
-
-def stop_reason_of(finish):
-    if finish == "length":
-        return "max_tokens"
-    if finish in ("tool_calls", "function_call"):
-        return "tool_use"
-    if finish == "content_filter":
-        return "refusal"
-    return "end_turn"
-
-
-# ---------------------------------------------------------------- answer translation (JSON)
-
-
-def openai_to_anthropic_answer(body, model):
-    choices = body.get("choices") if isinstance(body.get("choices"), list) else []
-    choice = choices[0] if len(choices) > 0 and is_record(choices[0]) else {}
-    message = choice.get("message") if is_record(choice.get("message")) else {}
-    content = []
-    text = message["content"] if isinstance(message.get("content"), str) else text_of(message.get("content"))
-    if text != "":
-        content.append({"type": "text", "text": text})
-    calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+def openai_to_anthropic(body: dict, model: str) -> dict:
+    """A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled."""
+    choices = body.get('choices') if isinstance(body.get('choices'), list) else []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = choice.get('message') if isinstance(choice.get('message'), dict) else {}
+    content: list[dict] = []
+    text = message['content'] if isinstance(message.get('content'), str) else text_of(message.get('content'))
+    if text != '':
+        content.append({'type': 'text', 'text': text})
+    calls = message.get('tool_calls') if isinstance(message.get('tool_calls'), list) else []
     for call in calls:
-        if not is_record(call) or not is_record(call.get("function")):
+        if not isinstance(call, dict) or not isinstance(call.get('function'), dict):
             continue
-        fn = call["function"]
+        fn = call['function']
         content.append(
             {
-                "type": "tool_use",
-                "id": call["id"] if isinstance(call.get("id"), str) else "toolu_unknown",
-                "name": fn["name"] if isinstance(fn.get("name"), str) else "",
-                "input": arguments_of(fn.get("arguments")),
+                'type': 'tool_use',
+                'id': call['id'] if isinstance(call.get('id'), str) else 'toolu_unknown',
+                'name': fn['name'] if isinstance(fn.get('name'), str) else '',
+                'input': arguments_of(fn.get('arguments')),
             }
         )
     if not content:
-        content.append({"type": "text", "text": ""})
-    usage = body.get("usage") if is_record(body.get("usage")) else {}
-    finish = choice.get("finish_reason")
-    stop_reason = stop_reason_of(finish)
-    if stop_reason not in LEGAL_ANTHROPIC_STOP:
-        stop_reason = "end_turn"
+        content.append({'type': 'text', 'text': ''})
+    usage = body.get('usage') if isinstance(body.get('usage'), dict) else {}
     return {
-        "id": "msg_" + (body["id"] if isinstance(body.get("id"), str) else "aggregate"),
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": number_or_zero(usage.get("prompt_tokens")),
-            "output_tokens": number_or_zero(usage.get("completion_tokens")),
+        'id': f'msg_{body["id"] if isinstance(body.get("id"), str) else "aggregate"}',
+        'type': 'message',
+        'role': 'assistant',
+        'model': model,
+        'content': content,
+        'stop_reason': stop_reason_of(choice.get('finish_reason')),
+        'stop_sequence': None,
+        'usage': {
+            'input_tokens': number_or_zero(usage.get('prompt_tokens')),
+            'output_tokens': number_or_zero(usage.get('completion_tokens')),
         },
     }
 
 
-def openai_json_with_model(body, model):
-    return {**body, "model": model}
+def openai_json_with_model(body: dict, model: str) -> dict:
+    """A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim."""
+    return {**body, 'model': model}
 
 
-# ---------------------------------------------------------------- SSE helpers and stream translation
+def sse_event(event: str | None, data: object) -> str:
+    """One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line."""
+    prefix = '' if event is None else f'event: {event}\n'
+    return f'{prefix}data: {json.dumps(data, separators=(",", ":"), ensure_ascii=False)}\n\n'
 
 
-def sse_event(event, data):
-    prefix = "" if event is None else "event: %s\n" % event
-    return "%sdata: %s\n\n" % (prefix, json.dumps(data, separators=(",", ":"), ensure_ascii=False))
-
-
-def iter_frames(chunks):
-    buffer = ""
-    for chunk in chunks:
-        buffer += chunk.decode("utf-8", "replace").replace("\r\n", "\n")
-        at = buffer.find("\n\n")
-        while at != -1:
-            frame = buffer[:at]
-            buffer = buffer[at + 2 :]
-            yield frame
-            at = buffer.find("\n\n")
-    if buffer.strip() != "":
-        yield buffer
-
-
-def frame_with_model(frame, model):
-    lines = []
-    for line in frame.split("\n"):
+def frame_with_model(frame: str, model: str) -> str:
+    """One SSE frame with every data payload's `model` set to `model`, and its blank line kept."""
+    lines: list[str] = []
+    for line in frame.split('\n'):
         trimmed = line.strip()
-        if not trimmed.startswith("data:"):
+        if not trimmed.startswith('data:'):
             lines.append(line)
             continue
         payload = trimmed[5:].strip()
-        if payload == "" or payload == "[DONE]":
+        if payload == '' or payload == '[DONE]':
             lines.append(line)
             continue
         try:
             chunk = json.loads(payload)
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             lines.append(line)
             continue
-        if is_record(chunk):
-            lines.append("data: " + json.dumps({**chunk, "model": model}, separators=(",", ":"), ensure_ascii=False))
+        if isinstance(chunk, dict):
+            lines.append(f'data: {json.dumps({**chunk, "model": model}, separators=(",", ":"), ensure_ascii=False)}')
         else:
             lines.append(line)
-    return "\n".join(lines) + "\n\n"
+    return '\n'.join(lines) + '\n\n'
 
 
-def openai_stream_with_model(chunks, model):
+def iter_frames(chunks):
+    """SSE frames from an upstream body's byte chunks, split on the blank line that ends each one."""
+    buffer = ''
+    for chunk in chunks:
+        buffer += chunk.decode('utf-8', 'replace').replace('\r\n', '\n')
+        at = buffer.find('\n\n')
+        while at != -1:
+            frame = buffer[:at]
+            buffer = buffer[at + 2 :]
+            yield frame
+            at = buffer.find('\n\n')
+    if buffer.strip() != '':
+        yield buffer
+
+
+def openai_stream_with_model(chunks, model: str):
+    """A Chat Completions SSE stream as it came, every data payload's `model` the id the entry dialled."""
     for frame in iter_frames(chunks):
         yield frame_with_model(frame, model)
 
 
-def anthropic_stream_from_openai(chunks, model):
-    """A Chat Completions SSE stream as the Anthropic event sequence, in strict order:
-    message_start, content_block_start/delta/stop per block, message_delta, message_stop.
+def anthropic_events_from_openai(chunks, model: str):
+    """A Chat Completions SSE stream as the Anthropic event sequence."""
+    started = False
+    finished = False
+    pending_stop: str | None = None
+    text_index = -1
+    next_index = 0
+    tool_indexes: dict[object, int] = {}
+    input_tokens: int | float = 0
+    output_tokens: int | float = 0
 
-    The whole upstream stream is read first so that message_start can carry the real input token
-    count (Anthropic reports input_tokens in message_start; OpenAI reports it only in the trailing
-    usage chunk) and message_delta the real output count — nothing is fabricated.
-    """
-    text_parts = []
-    tool_uses = []
-    input_tokens = 0
-    output_tokens = 0
-    finish = None
+    def start_events() -> list[str]:
+        nonlocal started
+        if started:
+            return []
+        started = True
+        return [
+            sse_event(
+                'message_start',
+                {
+                    'type': 'message_start',
+                    'message': {
+                        'id': 'msg_stream',
+                        'type': 'message',
+                        'role': 'assistant',
+                        'model': model,
+                        'content': [],
+                        'stop_reason': None,
+                        'stop_sequence': None,
+                        'usage': {'input_tokens': input_tokens, 'output_tokens': 0},
+                    },
+                },
+            )
+        ]
 
-    for frame in iter_frames(chunks):
-        for line in frame.split("\n"):
+    def close_events() -> list[str]:
+        nonlocal text_index
+        out: list[str] = []
+        if text_index != -1:
+            out.append(sse_event('content_block_stop', {'type': 'content_block_stop', 'index': text_index}))
+            text_index = -1
+        for index in sorted(tool_indexes.values()):
+            out.append(sse_event('content_block_stop', {'type': 'content_block_stop', 'index': index}))
+        tool_indexes.clear()
+        return out
+
+    def finish_events(stop_reason: str) -> list[str]:
+        nonlocal finished
+        if finished:
+            return []
+        finished = True
+        return [
+            *close_events(),
+            sse_event(
+                'message_delta',
+                {'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}},
+            ),
+            sse_event('message_stop', {'type': 'message_stop'}),
+        ]
+
+    def events_of_frame(frame: str) -> list[str]:
+        nonlocal input_tokens, output_tokens, text_index, next_index, pending_stop
+        out: list[str] = []
+        for line in frame.split('\n'):
             trimmed = line.strip()
-            if not trimmed.startswith("data:"):
+            if not trimmed.startswith('data:'):
                 continue
             payload = trimmed[5:].strip()
-            if payload == "" or payload == "[DONE]":
+            if payload == '[DONE]':
+                out.extend(start_events())
+                out.extend(finish_events(pending_stop if pending_stop is not None else 'end_turn'))
                 continue
             try:
                 chunk = json.loads(payload)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 continue
-            if not is_record(chunk):
+            if not isinstance(chunk, dict):
                 continue
-            if is_record(chunk.get("usage")):
-                input_tokens = number_or_zero(chunk["usage"].get("prompt_tokens"))
-                output_tokens = number_or_zero(chunk["usage"].get("completion_tokens"))
-            choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
-            if not choices:
+            if isinstance(chunk.get('usage'), dict):
+                input_tokens = number_or_zero(chunk['usage'].get('prompt_tokens'))
+                output_tokens = number_or_zero(chunk['usage'].get('completion_tokens'))
+            choices = chunk.get('choices') if isinstance(chunk.get('choices'), list) else []
+            choice = choices[0] if choices and isinstance(choices[0], dict) else None
+            if choice is None:
                 continue
-            choice = choices[0]
-            if not is_record(choice):
-                continue
-            delta = choice.get("delta") if is_record(choice.get("delta")) else {}
-            if isinstance(delta.get("content"), str):
-                text_parts.append(delta["content"])
-            for call in (delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else []):
-                if not is_record(call):
+            delta = choice.get('delta') if isinstance(choice.get('delta'), dict) else {}
+            out.extend(start_events())
+            if isinstance(delta.get('content'), str) and delta['content'] != '':
+                if text_index == -1:
+                    text_index = next_index
+                    next_index += 1
+                    out.append(
+                        sse_event('content_block_start', {'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})
+                    )
+                out.append(
+                    sse_event('content_block_delta', {'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': delta['content']}})
+                )
+            calls = delta.get('tool_calls') if isinstance(delta.get('tool_calls'), list) else []
+            for call in calls:
+                if not isinstance(call, dict):
                     continue
-                idx = call["index"] if is_number(call.get("index")) else len(tool_uses)
-                while len(tool_uses) <= idx:
-                    tool_uses.append({"id": "", "name": "", "arguments": ""})
-                if isinstance(call.get("id"), str) and tool_uses[idx]["id"] == "":
-                    tool_uses[idx]["id"] = call["id"]
-                fn = call.get("function") if is_record(call.get("function")) else {}
-                if isinstance(fn.get("name"), str) and tool_uses[idx]["name"] == "":
-                    tool_uses[idx]["name"] = fn["name"]
-                if isinstance(fn.get("arguments"), str):
-                    tool_uses[idx]["arguments"] += fn["arguments"]
-            if choice.get("finish_reason") is not None:
-                finish = choice["finish_reason"]
+                upstream_index = call['index'] if is_number(call.get('index')) else len(tool_indexes)
+                index = tool_indexes.get(upstream_index)
+                if index is None:
+                    if text_index != -1:
+                        out.append(sse_event('content_block_stop', {'type': 'content_block_stop', 'index': text_index}))
+                        text_index = -1
+                    index = next_index
+                    next_index += 1
+                    tool_indexes[upstream_index] = index
+                    fn = call.get('function') if isinstance(call.get('function'), dict) else {}
+                    out.append(
+                        sse_event(
+                            'content_block_start',
+                            {
+                                'type': 'content_block_start',
+                                'index': index,
+                                'content_block': {
+                                    'type': 'tool_use',
+                                    'id': call['id'] if isinstance(call.get('id'), str) and call['id'] != '' else f'toolu_{index}',
+                                    'name': fn['name'] if isinstance(fn.get('name'), str) else '',
+                                    'input': {},
+                                },
+                            },
+                        )
+                    )
+                fn = call.get('function') if isinstance(call.get('function'), dict) else {}
+                if isinstance(fn.get('arguments'), str) and fn['arguments'] != '':
+                    out.append(
+                        sse_event('content_block_delta', {'type': 'content_block_delta', 'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']}})
+                    )
+            if choice.get('finish_reason') is not None:
+                pending_stop = stop_reason_of(choice.get('finish_reason'))
+        return out
 
-    stop_reason = stop_reason_of(finish)
-    if stop_reason not in LEGAL_ANTHROPIC_STOP:
-        stop_reason = "end_turn"
+    for frame in iter_frames(chunks):
+        for event in events_of_frame(frame):
+            yield event
+    if not finished:
+        for event in start_events():
+            yield event
+        for event in finish_events(pending_stop if pending_stop is not None else 'end_turn'):
+            yield event
 
-    events = [
-        sse_event(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": "msg_stream",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-                },
-            },
-        )
-    ]
-    index = 0
-    text = "".join(text_parts)
-    if text != "":
-        events.append(sse_event("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}))
-        events.append(sse_event("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}}))
-        events.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": index}))
-        index += 1
-    for i, tu in enumerate(tool_uses):
-        events.append(
-            sse_event(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "tool_use", "id": tu["id"] or ("toolu_%d" % i), "name": tu["name"], "input": {}},
-                },
-            )
-        )
-        if tu["arguments"]:
-            events.append(
-                sse_event("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": tu["arguments"]}})
-            )
-        events.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": index}))
-        index += 1
-    if index == 0:
-        # No text and no tool use: still close with an empty text block so the message has content.
-        events.append(sse_event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}))
-        events.append(sse_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ""}}))
-        events.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
-    events.append(
-        sse_event(
-            "message_delta",
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
-            },
-        )
+
+# ---------------------------------------------------------------- the trial state
+
+TRIAL: af.Trial | None = None
+BRIEF: dict = {'models': [], 'prompts': [], 'error': 'not read'}
+CATALOG: dict = {'providers': []}
+PLANNED_GENERAL: str | None = None
+ENV_URL = ''
+GATEWAY_URL = ''
+GATEWAY_KEY = ''
+# Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order.
+manifest_index = 0
+manifest_lock = threading.Lock()
+
+
+def log(message: str) -> None:
+    sys.stderr.write(f'aggregator: {message}\n')
+    sys.stderr.flush()
+
+
+def chat_completions_url() -> str:
+    """The gateway's Chat Completions route.
+
+    OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the trial network); a base that does not
+    already end in `/v1` gets one, so both spellings reach the route.
+    """
+    if GATEWAY_URL == '':
+        return ''
+    return f'{GATEWAY_URL}/chat/completions' if GATEWAY_URL.endswith('/v1') else f'{GATEWAY_URL}/v1/chat/completions'
+
+
+def served_models() -> list[dict]:
+    """The free models the brief lists, as GET /v1/models names them."""
+    return [{'id': m['id'], 'provider': m['provider'], 'display_name': m['display_name']} for m in free_models(BRIEF)]
+
+
+def free_models_ranked(requires: dict) -> list[dict]:
+    """The free models meeting `requires`, sorted by rating (desc), ties keeping the brief's order."""
+    ranked = [m for m in free_models(BRIEF) if meets_requirements(requires, capabilities_of(m))]
+    ranked.sort(key=lambda m: -m['rating_milli'])
+    return ranked
+
+
+def find_model_by_id(model_id: str) -> dict | None:
+    for m in free_models(BRIEF):
+        if m['id'] == model_id:
+            return m
+    return None
+
+
+def route_candidates(requires: dict) -> list[dict]:
+    """The models to dial for a prompt, in dial order: the best by rating, the planned default first when
+    the planning call named a model at least as highly rated for a no-requirement prompt."""
+    ranked = free_models_ranked(requires)
+    if not ranked:
+        return []
+    if not requires and PLANNED_GENERAL is not None:
+        planned = find_model_by_id(PLANNED_GENERAL)
+        if planned is not None and planned['rating_milli'] >= ranked[0]['rating_milli']:
+            return [planned] + [m for m in ranked if m['id'] != planned['id']]
+    return ranked
+
+
+def requirements_for(body: dict) -> dict:
+    """The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own."""
+    global manifest_index
+    with manifest_lock:
+        index = manifest_index
+        manifest_index += 1
+    prompts = BRIEF.get('prompts') or []
+    if index < len(prompts):
+        return prompts[index]['requires']
+    return requirements_from_body(body)
+
+
+def requirements_from_body(body: dict) -> dict:
+    """Requirements read off a request body, when the brief has no row for it."""
+    messages = body.get('messages') if isinstance(body.get('messages'), list) else []
+    vision = False
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get('content'), list):
+            continue
+        for block in message['content']:
+            if isinstance(block, dict) and block.get('type') in ('image', 'image_url'):
+                vision = True
+    response_format = body.get('response_format')
+    response_type = response_format.get('type') if isinstance(response_format, dict) else None
+    return {'tools': isinstance(body.get('tools'), list) and len(body['tools']) > 0, 'vision': vision, 'json': response_type in ('json_object', 'json_schema')}
+
+
+# ---------------------------------------------------------------- the mandatory agent model call
+
+
+def normalize_model_id(raw: str) -> str:
+    """A model id spelled without the gateway prefix gets it back, so it matches a brief row."""
+    raw = raw.strip()
+    if not raw.lower().startswith('openrouter/'):
+        raw = 'openrouter/' + raw
+    return raw
+
+
+def extract_planned_model(answer: dict) -> str | None:
+    """The model id an agent call chose, from its Chat Completions answer; None when it named none."""
+    if not isinstance(answer, dict):
+        return None
+    choices = answer.get('choices')
+    text = ''
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get('message')
+        if isinstance(message, dict) and isinstance(message.get('content'), str):
+            text = message['content']
+    if text == '':
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ('model', 'id', 'general_model', 'default_model'):
+            value = parsed.get(key)
+            if isinstance(value, str):
+                normalized = normalize_model_id(value)
+                if find_model_by_id(normalized) is not None:
+                    return normalized
+    for m in free_models(BRIEF):
+        if m['id'] in text:
+            return m['id']
+    return None
+
+
+def make_planning_call(trial: af.Trial) -> str | None:
+    """One deterministic agent call through the gateway: plan the default model for simple prompts.
+
+    The request body is fixed (a function of the brief only), and a refused call fails over to the next
+    free model, so the live pass and its replay make the same requests in the same order.
+    """
+    ranked = free_models_ranked({})
+    if not ranked:
+        return None
+    listing = [{'id': m['id'], 'rating_milli': m['rating_milli']} for m in ranked]
+    prompt = (
+        'You are the routing planner of a free-model aggregator. From the model list below, choose the '
+        'single model best suited to serve simple text-completion prompts (no tools, no JSON mode, no '
+        'image input), preferring the highest rating. Reply with exactly one JSON object of the form '
+        '{"model": "<id>"} and nothing else.\n'
+        'Models: ' + json.dumps(listing, separators=(',', ':'), ensure_ascii=False)
     )
-    events.append(sse_event("message_stop", {"type": "message_stop"}))
-    return "".join(events)
+    client = af.OpenAI(trial, max_retries=0)
+    for model in ranked:
+        body = {
+            'model': model['id'],
+            'messages': [
+                {'role': 'system', 'content': 'You are a careful routing planner. Do exactly what is asked, nothing more.'},
+                {'role': 'user', 'content': prompt},
+            ],
+            'max_tokens': DEFAULT_MAX_TOKENS,
+        }
+        try:
+            answer = client.chat(body)
+        except af.LlmError:
+            continue
+        return extract_planned_model(answer)
+    return None
 
 
 # ---------------------------------------------------------------- the gateway
 
 
-def chat_completions_url():
-    if GATEWAY_URL == "":
-        return ""
-    if GATEWAY_URL.endswith("/v1"):
-        return GATEWAY_URL + "/chat/completions"
-    return GATEWAY_URL + "/v1/chat/completions"
+class Upstream:
+    """One gateway answer: its status and a body that may be read whole or as byte chunks."""
+
+    def __init__(self, status: int, response) -> None:
+        self.status = status
+        self._response = response
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+    def chunks(self):
+        """The body's bytes as they arrive, never waiting to fill a buffer (SSE must stream)."""
+        reader = getattr(self._response, 'read1', None) or self._response.read
+        while True:
+            chunk = reader(65536)
+            if not chunk:
+                break
+            yield chunk
+
+    def text(self) -> str:
+        try:
+            return self._response.read().decode('utf-8', 'replace')
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        try:
+            self._response.close()
+        except Exception:
+            pass
 
 
-def dial(model, body):
+def ensure_max_tokens(body: dict) -> dict:
+    """Ensure the gateway's output cap is present and within its bounds; return the (possibly new) body."""
+    key = 'max_completion_tokens' if 'max_completion_tokens' in body else ('max_tokens' if 'max_tokens' in body else None)
+    if key is None:
+        body['max_tokens'] = DEFAULT_MAX_TOKENS
+        return body
+    value = body[key]
+    if is_number(value):
+        n = int(value)
+        if n < 1:
+            n = DEFAULT_MAX_TOKENS
+        elif n > MAX_ALLOWED_TOKENS:
+            n = MAX_ALLOWED_TOKENS
+        body[key] = n
+    else:
+        body[key] = DEFAULT_MAX_TOKENS
+    return body
+
+
+def dial(model: str, body: dict) -> Upstream:
+    """POST one request to the gateway's Chat Completions route, naming the model this entry dialled."""
     url = chat_completions_url()
-    if url == "":
-        raise RuntimeError("OPENAI_BASE_URL is not set")
-    data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    headers = {"content-type": "application/json", "authorization": "Bearer " + GATEWAY_KEY}
-    if body.get("stream") is True:
-        headers["accept"] = "text/event-stream"
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    if url == '':
+        raise RuntimeError('OPENAI_BASE_URL is not set')
+    data = json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    headers = {'content-type': 'application/json', 'authorization': f'Bearer {GATEWAY_KEY}'}
+    if body.get('stream') is True:
+        headers['accept'] = 'text/event-stream'
+    request = urllib.request.Request(url, data=data, headers=headers, method='POST')
     try:
-        response = urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT_SEC)
+        response = urllib.request.urlopen(request)
     except urllib.error.HTTPError as err:
-        return err.code, err.read()
-    return response.status, response
+        # A refusal is an answer with a status and a body, exactly as Node's fetch reports it.
+        return Upstream(err.code, err)
+    return Upstream(response.status, response)
 
 
-def error_code_of(body_bytes):
-    if body_bytes is None:
-        return ""
+def error_code_of(text: str) -> str:
+    """The error `type` (or `code`) of a refused answer's body, or '' when there is none."""
     try:
-        value = json.loads(body_bytes.decode("utf-8", "replace"))
-    except Exception:
-        return ""
-    if not is_record(value) or not is_record(value.get("error")):
-        return ""
-    err = value["error"]
-    code = err.get("code")
-    if isinstance(code, str) and code != "":
-        return code[:64]
-    typ = err.get("type")
-    if isinstance(typ, str):
-        return typ[:64]
-    return ""
+        body = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return ''
+    if not isinstance(body, dict):
+        return ''
+    err = body.get('error')
+    if isinstance(err, dict):
+        t = err.get('type')
+        if isinstance(t, str):
+            return t
+        c = err.get('code')
+        if isinstance(c, str):
+            return c
+    return ''
 
 
-# ---------------------------------------------------------------- trial state
-
-# Built once in configure_server(), from the trial's brief, before the server starts.
-BRIEF = None
-FREE = []
-CATALOG = None
-SERVED = []
-# The agent's one model call yields a preferred serving order, kept as a tie-break behind each
-# model's rating; {} (the fallback) sorts by rating then id, the brief's own order.
-ROUTING_RANK = {}
-_TRIAL_SEED = ""
-
-# Permanently unavailable models (a refusal the trial will not recover from) and a per-model 429
-# counter. Both are functions of the gateway answers seen so far, never the wall clock, so a replay
-# leaves them the same.
-DEAD = set()
-REFUSAL_COUNT = {}
-DEAD_LOCK = threading.Lock()
-
-MANIFEST_INDEX = 0
-MANIFEST_LOCK = threading.Lock()
-
-
-def next_manifest_requires():
-    global MANIFEST_INDEX
-    with MANIFEST_LOCK:
-        index = MANIFEST_INDEX
-        MANIFEST_INDEX += 1
-    if index < len(BRIEF["prompts"]):
-        return BRIEF["prompts"][index]["requires"]
-    return None
-
-
-# ---------------------------------------------------------------- the agent's own model call
-
-
-def best_free_model_id():
-    """The strongest free model on the brief, for the agent's one call (rating, then id)."""
-    rows = sorted(FREE, key=lambda m: (-m["rating_milli"], m["id"]))
-    return rows[0]["id"] if rows else None
-
-
-def routing_prompt():
-    """The routing question, a pure function of the brief and the trial's seed: same seed, same bytes."""
-    rows = sorted(FREE, key=lambda m: m["id"])
-    lines = []
-    for m in rows:
-        caps = [c for c in ("tools", "vision", "json") if m[c]]
-        lines.append(
-            "%s | rating=%d | context=%s | %s"
-            % (
-                m["id"],
-                m["rating_milli"],
-                "null" if m["context_length"] is None else str(m["context_length"]),
-                ",".join(caps) if caps else "none",
-            )
-        )
-    return (
-        "You route prompts for a free-model aggregator. Given the free models below (id, house "
-        "rating where higher is stronger, context length, capabilities), return ONLY a JSON array "
-        "of their ids in your preferred serving order, best first. Reply with the JSON array and "
-        "nothing else.\n"
-        "trial seed: %s\n%s" % (_TRIAL_SEED, "\n".join(lines))
-    )
-
-
-def first_json_array(text):
-    """The first JSON array in `text`, or None; string contents and nesting are honoured."""
-    start = text.find("[")
-    if start == -1:
+def failures_header(failures: list[dict]) -> str | None:
+    """The x-makefun-upstream-failures header value: at most 8 rows, or None when there were none."""
+    if not failures:
         return None
-    depth = 0
-    in_string = False
-    i = start
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if in_string:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                try:
-                    value = json.loads(text[start : i + 1])
-                except Exception:
-                    return None
-                return value if isinstance(value, list) else None
-        i += 1
-    return None
+    return json.dumps(failures[:8], separators=(',', ':'), ensure_ascii=False)
 
 
-def extract_model_ids(answer):
-    """The model ids a Chat Completions answer's first message names, in order; [] when unusable."""
-    if not is_record(answer):
-        return []
-    choices = answer.get("choices")
-    if not isinstance(choices, list) or not choices or not is_record(choices[0]):
-        return []
-    message = choices[0].get("message")
-    if not is_record(message):
-        return []
-    content = message.get("content")
-    text = content if isinstance(content, str) else ""
-    if text == "":
-        return []
-    value = first_json_array(text)
-    if value is None:
-        return []
-    return [v for v in value if isinstance(v, str) and v != ""]
+def dial_with_failover(candidates: list[dict], make_body):
+    """Dial the candidates in order until one answers; return (upstream, model_id, failures).
 
-
-def build_routing_rank(trial):
-    """Make the agent's one real model call and keep its answer as ROUTING_RANK (a tie-break).
-
-    The call is a completion (a real model answer, not a listing), so the trial's "the agent made no
-    model call" check sees one. The request is a function of the brief and the trial's seed alone,
-    and the decision is made once, so a replay records the same call and the gateway answers it the
-    same way. A refusal or an unusable answer falls back to {} (rating, then id), deterministically.
+    `make_body(model_id)` builds the Chat Completions body for one candidate. A refused answer (any
+    non-2xx) is recorded in `failures` and the next candidate is tried; a connection failure that never
+    reached the gateway is recorded with status 0 and no error code.
     """
-    global ROUTING_RANK
-    model_id = best_free_model_id()
-    if model_id is None:
-        ROUTING_RANK = {}
-        return
-    body = {
-        "model": model_id,
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": routing_prompt()}],
-    }
-    try:
-        answer = af.OpenAI(trial).chat(body)
-    except af.LlmError as err:
-        log("routing call answered %s %s: using the brief's ratings alone" % (err.status, err.type or ""))
-        ROUTING_RANK = {}
-        return
-    order = extract_model_ids(answer)
-    valid = {m["id"] for m in FREE}
-    seen = set()
-    preference = []
-    for mid in order:
-        if mid in valid and mid not in seen:
-            seen.add(mid)
-            preference.append(mid)
-    ROUTING_RANK = {mid: i for i, mid in enumerate(preference)}
-    log("routing preference from the model: %d ids" % len(preference))
+    failures: list[dict] = []
+    for model in candidates:
+        mid = model['id']
+        body = make_body(mid)
+        try:
+            upstream = dial(mid, body)
+        except Exception:
+            failures.append({'status': 0, 'code': '', 'model': mid})
+            continue
+        if upstream.ok:
+            return upstream, mid, failures
+        text = upstream.text()
+        failures.append({'status': upstream.status, 'code': error_code_of(text), 'model': mid})
+    return None, None, failures
 
 
 # ---------------------------------------------------------------- the HTTP server
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server_version = "makefun-aggregator-py/1"
-    sys_version = ""
+    """The entry's one server: the models route, the two completion wires, and nothing else."""
 
-    def log_message(self, fmt, *args):
+    protocol_version = 'HTTP/1.1'
+    server_version = 'makefun-aggregator/1'
+    sys_version = ''
+
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
-    def do_GET(self):
-        self._dispatch()
+    def do_GET(self) -> None:
+        self.dispatch()
 
-    def do_POST(self):
-        self._dispatch()
+    def do_POST(self) -> None:
+        self.dispatch()
 
-    # -- plumbing ---------------------------------------------------------
-
-    def _dispatch(self):
+    def dispatch(self) -> None:
         self.headers_sent = False
-        path = urllib.parse.urlsplit(self.path).path
+        path = urlsplit(self.path).path
         try:
-            if self.command == "GET" and path == "/v1/models":
-                self._models()
+            if self.command == 'GET' and path == '/v1/models':
+                self.models()
                 return
-            if self.command == "POST" and path == "/v1/chat/completions":
-                self._chat()
+            if self.command == 'POST' and path == '/v1/chat/completions':
+                self.chat()
                 return
-            if self.command == "POST" and path == "/v1/messages":
-                self._messages()
+            if self.command == 'POST' and path == '/v1/messages':
+                self.messages()
                 return
-            wire = "anthropic" if path == "/v1/messages" else "openai"
-            self._send_error(wire, 404, "not_found", "no route %s %s" % (self.command, path))
+            wire = 'anthropic' if path == '/v1/messages' else 'openai'
+            self.send_error_body(wire, 404, 'not_found', f'no route {self.command} {path}')
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
-        except Exception as err:
-            log("request failed: %r" % err)
+        except Exception:
+            log(traceback.format_exc())
             if not self.headers_sent:
-                wire = "anthropic" if urllib.parse.urlsplit(self.path).path.startswith("/v1/messages") else "openai"
+                wire = 'anthropic' if urlsplit(self.path).path.startswith('/v1/messages') else 'openai'
                 try:
-                    self._send_error(wire, 500, "internal_error", "the server failed to answer")
+                    self.send_error_body(wire, 500, 'internal_error', 'the server failed to answer')
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
 
-    def _read_body(self):
-        length = self.headers.get("content-length")
-        if length is None:
-            return None
-        try:
-            size = int(length)
-        except ValueError:
-            return None
-        if size < 0 or size > MAX_BODY_BYTES:
-            return None
-        return self.rfile.read(size) if size > 0 else b""
-
-    def _read_json(self):
-        body = self._read_body()
-        if body is None or body == b"":
-            return None
-        try:
-            value = json.loads(body.decode("utf-8"))
-        except Exception:
-            return None
-        return value if is_record(value) else None
-
-    def _send_json(self, status, value):
-        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-        raw = text.encode("utf-8")
+    def send_json(self, status: int, body: object, extra_headers: dict | None = None) -> None:
+        text = json.dumps(body, separators=(',', ':'), ensure_ascii=False)
+        raw = text.encode('utf-8')
         self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(raw)))
+        self.send_header('content-type', 'application/json')
+        self.send_header('content-length', str(len(raw)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.headers_sent = True
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_error(self, wire, status, error_type, message):
-        if wire == "anthropic":
-            self._send_json(status, {"type": "error", "error": {"type": error_type, "message": message}})
+    def send_error_body(self, wire: str, status: int, error_type: str, message: str) -> None:
+        if wire == 'anthropic':
+            self.send_json(status, anthropic_error(error_type, message))
         else:
-            self._send_json(status, {"error": {"message": message, "type": error_type}})
+            self.send_json(status, openai_error(message, error_type, None))
 
-    def _stream_headers(self, trail):
+    def stream_headers(self, extra_headers: dict | None = None) -> None:
         self.send_response(200)
-        self.send_header("content-type", "text/event-stream")
-        self.send_header("cache-control", "no-cache")
-        if trail is not None:
-            self.send_header("x-makefun-upstream-failures", json.dumps(trail, separators=(",", ":"), ensure_ascii=False))
-        self.send_header("connection", "close")
+        self.send_header('content-type', 'text/event-stream')
+        self.send_header('cache-control', 'no-cache')
+        # Python's http.server does not chunk a response without a length; the close ends the stream.
+        self.send_header('connection', 'close')
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.headers_sent = True
         self.end_headers()
         self.close_connection = True
 
-    def _write_event(self, text):
-        self.wfile.write(text.encode("utf-8"))
+    def write_event(self, text: str) -> None:
+        self.wfile.write(text.encode('utf-8'))
         self.wfile.flush()
 
-    # -- routes -----------------------------------------------------------
+    def read_json(self) -> dict | None:
+        """One client request body, or None when it is not one JSON object or is too large."""
+        length = self.headers.get('content-length')
+        if length is None:
+            self.close_connection = True
+            return None
+        try:
+            size = int(length)
+        except ValueError:
+            self.close_connection = True
+            return None
+        if size < 0 or size > MAX_BODY_BYTES:
+            self.close_connection = True
+            return None
+        raw = self.rfile.read(size) if size > 0 else b''
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
 
-    def _models(self):
-        if self.headers.get("x-api-key") is not None:
-            self._send_json(
-                200,
-                {
-                    "data": [
-                        {"type": "model", "id": m["id"], "display_name": m["display_name"], "created_at": FIXED_ANTHROPIC_CREATED_AT}
-                        for m in SERVED
-                    ],
-                    "has_more": False,
-                },
-            )
+    def refused(self, wire: str, failures: list[dict]) -> None:
+        """Every candidate was refused: a 502 in the client's wire, with the failure trail."""
+        last = failures[-1] if failures else {'status': 0, 'code': '', 'model': None}
+        trail = failures_header(failures)
+        headers = {'x-makefun-upstream-failures': trail} if trail is not None else None
+        if last['status'] == 0:
+            suffix = ''
         else:
-            self._send_json(
-                200,
-                {
-                    "object": "list",
-                    "data": [{"id": m["id"], "object": "model", "created": FIXED_OPENAI_CREATED, "owned_by": m["provider"]} for m in SERVED],
-                },
-            )
+            code = last['code']
+            suffix = f': the gateway answered HTTP {last["status"]}' + (f' {code}' if code else '')
+        message = f'every free model that meets this request was refused{suffix}'
+        if wire == 'anthropic':
+            self.send_json(502, anthropic_error('api_error', message), headers)
+        else:
+            self.send_json(502, openai_error(message, 'upstream_error', None), headers)
 
-    # -- completion serving ----------------------------------------------
+    def models(self) -> None:
+        """GET /v1/models, in the shape of the auth header the client sent."""
+        listing = served_models()
+        if self.headers.get('x-api-key') is not None:
+            self.send_json(200, anthropic_model_list(listing))
+        else:
+            self.send_json(200, openai_model_list(listing))
 
-    def _serve(self, client_wire, body):
-        stream = body.get("stream") is True
-        requires = requirements_for(body, next_manifest_requires())
-        trail = []
-        for model in candidate_models(requires):
-            mid = model["id"]
-            upstream_body = anthropic_to_openai(body, mid) if client_wire == "anthropic" else openai_to_openai(body, mid)
+    def chat(self) -> None:
+        """POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it."""
+        body = self.read_json()
+        if body is None:
+            self.send_error_body('openai', 400, 'invalid_request_error', 'the request body is not one JSON object')
+            return
+        requires = requirements_for(body)
+        candidates = route_candidates(requires)
+        if not candidates:
+            self.send_error_body('openai', 503, 'no_free_model', 'no free model in the brief meets this request')
+            return
+        stream = body.get('stream') is True
+        upstream, mid, failures = dial_with_failover(candidates, lambda m: ensure_max_tokens({**body, 'model': m}))
+        if upstream is None:
+            self.refused('openai', failures)
+            return
+        trail = failures_header(failures)
+        headers = {'x-makefun-upstream-failures': trail} if trail is not None else None
+        if stream:
+            self.stream_headers(headers)
             try:
-                status, upstream = dial(mid, upstream_body)
-            except Exception:
-                # An unreachable gateway is not a refusal the trail can report; keep the model
-                # available and try the next one.
-                continue
-            if status >= 400:
-                try:
-                    body_bytes = upstream if isinstance(upstream, (bytes, bytearray)) else upstream.read()
-                except Exception:
-                    body_bytes = b""
-                if not isinstance(upstream, (bytes, bytearray)):
-                    try:
-                        upstream.close()
-                    except Exception:
-                        pass
-                if len(trail) < 8:
-                    trail.append({"status": status, "code": error_code_of(body_bytes), "model": mid})
-                with DEAD_LOCK:
-                    if status in PERMANENT_REFUSAL_STATUS:
-                        DEAD.add(mid)
-                    elif status == 429:
-                        REFUSAL_COUNT[mid] = REFUSAL_COUNT.get(mid, 0) + 1
-                        if REFUSAL_COUNT[mid] >= MAX_429_BEFORE_DEAD:
-                            DEAD.add(mid)
-                continue
-            # Success: serve the gateway's answer back in the client's wire.
-            if stream:
-                self._stream_headers(trail if trail else None)
-                try:
-                    if client_wire == "openai":
-                        for frame in openai_stream_with_model(upstream_chunks(upstream), mid):
-                            self._write_event(frame)
-                    else:
-                        self._write_event(anthropic_stream_from_openai(upstream_chunks(upstream), mid))
-                finally:
-                    close_upstream(upstream)
-                return
-            try:
-                body_bytes = upstream.read()
+                for frame in openai_stream_with_model(upstream.chunks(), mid):
+                    self.write_event(frame)
             finally:
-                close_upstream(upstream)
+                upstream.close()
+            return
+        answer = upstream.text()
+        try:
+            parsed = json.loads(answer)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        self.send_json(200, openai_json_with_model(parsed if isinstance(parsed, dict) else {}, mid), headers)
+
+    def messages(self) -> None:
+        """POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back."""
+        body = self.read_json()
+        if body is None:
+            self.send_error_body('anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object')
+            return
+        requires = requirements_for(body)
+        candidates = route_candidates(requires)
+        if not candidates:
+            self.send_error_body('anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request')
+            return
+        stream = body.get('stream') is True
+        upstream, mid, failures = dial_with_failover(candidates, lambda m: ensure_max_tokens(anthropic_to_openai(body, m)))
+        if upstream is None:
+            self.refused('anthropic', failures)
+            return
+        trail = failures_header(failures)
+        headers = {'x-makefun-upstream-failures': trail} if trail is not None else None
+        if stream:
+            self.stream_headers(headers)
             try:
-                parsed = json.loads(body_bytes.decode("utf-8", "replace"))
-            except Exception:
-                parsed = None
-            if not is_record(parsed):
-                # A 2xx that is not one JSON object: treat it as an unusable answer and fail over.
-                continue
-            if client_wire == "anthropic":
-                answer = openai_to_anthropic_answer(parsed, mid)
-            else:
-                answer = openai_json_with_model(parsed, mid)
-            self._send_json_with_trail(200, answer, trail)
+                for event in anthropic_events_from_openai(upstream.chunks(), mid):
+                    self.write_event(event)
+            finally:
+                upstream.close()
             return
-        # Every candidate refused or broke: give up.
-        if client_wire == "anthropic":
-            self._send_error("anthropic", 503, "overloaded_error", "no free model on the brief meets this request")
-        else:
-            self._send_error("openai", 503, "no_free_model", "no free model on the brief meets this request")
-
-    def _send_json_with_trail(self, status, value, trail):
-        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-        raw = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        if trail:
-            self.send_header("x-makefun-upstream-failures", json.dumps(trail, separators=(",", ":"), ensure_ascii=False))
-        self.send_header("content-length", str(len(raw)))
-        self.headers_sent = True
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def _chat(self):
-        body = self._read_json()
-        if body is None:
-            self._send_error("openai", 400, "invalid_request_error", "the request body is not one JSON object")
-            return
-        self._serve("openai", body)
-
-    def _messages(self):
-        body = self._read_json()
-        if body is None:
-            self._send_error("anthropic", 400, "invalid_request_error", "the request body is not one JSON object")
-            return
-        self._serve("anthropic", body)
-
-
-def upstream_chunks(upstream):
-    reader = getattr(upstream, "read1", None) or upstream.read
-    while True:
-        chunk = reader(65536)
-        if not chunk:
-            break
-        yield chunk
-
-
-def close_upstream(upstream):
-    try:
-        upstream.close()
-    except Exception:
-        pass
+        answer = upstream.text()
+        try:
+            parsed = json.loads(answer)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        self.send_json(200, openai_to_anthropic(parsed if isinstance(parsed, dict) else {}, mid), headers)
 
 
 # ---------------------------------------------------------------- register and poll
 
 
-def register(port, catalog):
-    body = json.dumps({"protocol_version": PROTOCOL_VERSION, "port": port, "catalog": catalog}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        ENV_URL + "/register", data=body, headers={"content-type": "application/json"}, method="POST"
-    )
+def register(port: int, report: dict) -> None:
+    """POST /register with the port and the one catalog; the env answers with the trial's prompt count."""
+    body = json.dumps({'protocol_version': PROTOCOL_VERSION, 'port': port, 'catalog': report}, separators=(',', ':'), ensure_ascii=False)
+    request = urllib.request.Request(f'{ENV_URL}/register', data=body.encode('utf-8'), headers={'content-type': 'application/json'}, method='POST')
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             status = response.status
-            reply_text = response.read().decode("utf-8", "replace")
+            reply_text = response.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as err:
-        raise RuntimeError("POST %s/register answered HTTP %s: %s" % (ENV_URL, err.code, err.read().decode("utf-8", "replace")[:500])) from err
+        raise RuntimeError(f'POST {ENV_URL}/register answered HTTP {err.code}: {err.read().decode("utf-8", "replace")[:500]}') from err
     if not (200 <= status < 300):
-        raise RuntimeError("POST %s/register answered HTTP %s: %s" % (ENV_URL, status, reply_text[:500]))
+        raise RuntimeError(f'POST {ENV_URL}/register answered HTTP {status}: {reply_text[:500]}')
     try:
         reply = json.loads(reply_text)
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         reply = None
-    if is_record(reply) and is_number(reply.get("requests")):
-        log("registered: the trial holds %s prompts" % reply["requests"])
+    if isinstance(reply, dict) and is_number(reply.get('requests')):
+        log(f'registered: the trial holds {reply["requests"]} prompts')
 
 
-def poll(server):
+def poll() -> None:
+    """Poll GET /work every 100 ms; exit 0 the moment it says done."""
     while True:
         time.sleep(POLL_INTERVAL_SEC)
         try:
-            with urllib.request.urlopen(ENV_URL + "/work", timeout=5) as response:
+            with urllib.request.urlopen(f'{ENV_URL}/work', timeout=2) as response:
                 if response.status != 200:
                     continue
-                work = json.loads(response.read().decode("utf-8", "replace"))
+                work = json.loads(response.read().decode('utf-8', 'replace'))
         except Exception:
             continue
-        if is_record(work) and work.get("done") is True:
+        if isinstance(work, dict) and work.get('done') is True:
             sys.stderr.flush()
             os._exit(0)
 
 
-def stop(*_):
+def stop(*_: object) -> None:
+    """SIGTERM and SIGINT end the trial as Node's process.exit(0) does: exit 0, at once."""
     sys.stderr.flush()
     os._exit(0)
 
@@ -1199,75 +1251,60 @@ def stop(*_):
 # ---------------------------------------------------------------- start
 
 
-def start():
-    if BRIEF["error"] is not None:
-        log(BRIEF["error"])
-    if ENV_URL == "":
-        raise RuntimeError("MAKEFUN_ENV_URL is not set")
-    if chat_completions_url() == "":
-        raise RuntimeError("OPENAI_BASE_URL is not set")
-
-    server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+def start() -> None:
+    if BRIEF.get('error') is not None:
+        log(BRIEF['error'])
+    if ENV_URL == '':
+        raise RuntimeError('MAKEFUN_ENV_URL is not set')
+    if chat_completions_url() == '':
+        raise RuntimeError('OPENAI_BASE_URL is not set')
+    server = ThreadingHTTPServer(('0.0.0.0', 0), Handler)
     try:
         port = server.server_address[1]
+        # 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
         if port == 8080:
-            raise RuntimeError("the OS picked 8080, which the env owns on one layout: restart the trial")
-        log("listening on 0.0.0.0:%s with %d free models" % (port, len(SERVED)))
+            raise RuntimeError('the OS picked 8080, which the env owns on one layout: restart the trial')
+        log(f'listening on 0.0.0.0:{port} with {len(served_models())} free models')
         register(port, CATALOG)
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
-        threading.Thread(target=poll, args=(server,), name="work-poll", daemon=True).start()
+        threading.Thread(target=poll, name='work-poll', daemon=True).start()
         server.serve_forever()
     finally:
         server.server_close()
 
 
-def configure_server(trial):
-    """Point the server's module globals at the trial the SDK read (and log any brief error)."""
-    global ENV_URL, PROMPT_FILE, GATEWAY_URL, GATEWAY_KEY, BRIEF, FREE, CATALOG, SERVED, _TRIAL_SEED
-    ENV_URL = trial.env_url
-    PROMPT_FILE = trial.prompt_file
-    GATEWAY_URL = trial.openai.base_url
-    GATEWAY_KEY = trial.openai.api_key
-    _TRIAL_SEED = trial.seed
-    BRIEF = read_brief(PROMPT_FILE)
-    FREE = free_models(BRIEF)
-    CATALOG = build_catalog(FREE)
-    SERVED = served_models(FREE)
-
-
-def run_list():
-    """`--list`: print the catalog the register body carries, byte for byte, and exit before any
-    trial or server starts (works with or without the agent/v1 environment)."""
-    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE", "") or ""
-    brief = read_brief(prompt_file)
-    if brief["error"] is not None:
-        log(brief["error"])
-    catalog = build_catalog(free_models(brief))
-    sys.stdout.write(json.dumps(catalog, separators=(",", ":"), ensure_ascii=False) + "\n")
+def list_catalog() -> None:
+    """`--list` prints the catalog document and exits 0, before any server starts."""
+    brief = read_brief_file(os.environ.get('MAKEFUN_PROMPT_FILE', ''))
+    catalog = build_catalog(brief)
+    sys.stdout.write(json.dumps(catalog, separators=(',', ':'), ensure_ascii=False) + '\n')
     sys.stdout.flush()
 
 
-def main():
-    if "--list" in sys.argv[1:]:
-        run_list()
+def main() -> int:
+    global TRIAL, BRIEF, CATALOG, PLANNED_GENERAL, ENV_URL, GATEWAY_URL, GATEWAY_KEY
+    if '--list' in sys.argv[1:]:
+        list_catalog()
         return 0
+    TRIAL = af.read_trial()
+    BRIEF = read_brief(TRIAL.prompt)
+    CATALOG = build_catalog(BRIEF)
+    ENV_URL = TRIAL.env_url.rstrip('/')
+    GATEWAY_URL = TRIAL.openai.base_url
+    GATEWAY_KEY = TRIAL.openai.api_key
+    PLANNED_GENERAL = make_planning_call(TRIAL)
+    if PLANNED_GENERAL is not None:
+        log(f'planned default model: {PLANNED_GENERAL}')
+    start()
+    return 0
+
+
+if __name__ == '__main__':
     try:
-        trial = af.read_trial()
-    except af.TrialConfigError as err:
-        log("fatal: %r" % err)
-        return 1
-    configure_server(trial)
-    build_routing_rank(trial)
-    try:
-        start()
-        return 0
+        raise SystemExit(main())
     except SystemExit:
         raise
-    except BaseException as err:
-        log("fatal: %r" % err)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    except BaseException:
+        log(traceback.format_exc())
+        raise SystemExit(1)
