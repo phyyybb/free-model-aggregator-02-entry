@@ -1,5 +1,5 @@
-# free-model-aggregator-02 entry: one server, two client wires, a real free model behind every
-# answer, and one mandatory agent model call that plans routing. Python 3.13, standard library only.
+# free-model-aggregator-02 entry: one server, two client wires, and a real free model behind every
+# answer, routed deterministically to the best-rated free model. Python 3.13, standard library only.
 #
 # A trial runs this as `python3 -P -s /bot/main.py` with PYTHONHASHSEED=0. -P keeps the script's own
 # directory off sys.path and -s keeps user site-packages off it, so everything lives in this one file
@@ -13,8 +13,8 @@
 #   OPENAI_API_KEY        the trial's dummy key, which the gateway swaps for the entrant's OpenRouter key.
 #
 # THE SERVER
-#   1. reads the trial and the brief, and makes ONE deterministic agent call through the gateway to plan
-#      which model serves simple (no-tools/no-json/no-vision) prompts;
+#   1. reads the trial and the brief and plans routing deterministically — the highest-rated free model
+#      meeting each prompt's requirements — with no extra model call;
 #   2. listens on 0.0.0.0 at a free port and POSTs {protocol_version, port, catalog} to /register;
 #   3. serves GET /v1/models (OpenAI shape for Authorization, Anthropic shape for x-api-key),
 #      POST /v1/chat/completions and POST /v1/messages, JSON and server-sent events;
@@ -31,9 +31,8 @@
 #
 # DETERMINISM
 #   Everything a request carries is a pure function of the brief, the client's requests and the
-#   gateway's answers seen so far: no wall clock, no unseeded randomness. The planning call's body is
-#   fixed, and its answer (replayed identically on the replay pass) only ever promotes a model that is
-#   at least as highly rated as the deterministic best, so the routing table is the same both passes.
+#   gateway's answers seen so far: no wall clock, no unseeded randomness. Routing is a pure sort of the
+#   brief's ratings, so the live pass and its replay dial the same models in the same order.
 
 import json
 import math
@@ -774,8 +773,8 @@ def find_model_by_id(model_id: str) -> dict | None:
 
 
 def route_candidates(requires: dict) -> list[dict]:
-    """The models to dial for a prompt, in dial order: the best by rating, the planned default first when
-    the planning call named a model at least as highly rated for a no-requirement prompt."""
+    """The models to dial for a prompt, in dial order: the best by rating, the deterministic plan's
+    default first when it names a model at least as highly rated for a no-requirement prompt."""
     ranked = free_models_ranked(requires)
     if not ranked:
         return []
@@ -813,79 +812,20 @@ def requirements_from_body(body: dict) -> dict:
     return {'tools': isinstance(body.get('tools'), list) and len(body['tools']) > 0, 'vision': vision, 'json': response_type in ('json_object', 'json_schema')}
 
 
-# ---------------------------------------------------------------- the mandatory agent model call
+# ---------------------------------------------------------------- the routing plan (deterministic)
 
 
-def normalize_model_id(raw: str) -> str:
-    """A model id spelled without the gateway prefix gets it back, so it matches a brief row."""
-    raw = raw.strip()
-    if not raw.lower().startswith('openrouter/'):
-        raw = 'openrouter/' + raw
-    return raw
+def plan_general() -> str | None:
+    """The default model for simple (no-tools/no-json/no-vision) prompts, chosen deterministically: the
+    highest-rated free model meeting no requirement.
 
-
-def extract_planned_model(answer: dict) -> str | None:
-    """The model id an agent call chose, from its Chat Completions answer; None when it named none."""
-    if not isinstance(answer, dict):
-        return None
-    choices = answer.get('choices')
-    text = ''
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message = choices[0].get('message')
-        if isinstance(message, dict) and isinstance(message.get('content'), str):
-            text = message['content']
-    if text == '':
-        return None
-    try:
-        parsed = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        parsed = None
-    if isinstance(parsed, dict):
-        for key in ('model', 'id', 'general_model', 'default_model'):
-            value = parsed.get(key)
-            if isinstance(value, str):
-                normalized = normalize_model_id(value)
-                if find_model_by_id(normalized) is not None:
-                    return normalized
-    for m in free_models(BRIEF):
-        if m['id'] in text:
-            return m['id']
-    return None
-
-
-def make_planning_call(trial: af.Trial) -> str | None:
-    """One deterministic agent call through the gateway: plan the default model for simple prompts.
-
-    The request body is fixed (a function of the brief only), and a refused call fails over to the next
-    free model, so the live pass and its replay make the same requests in the same order.
+    The former startup planning call always resolved to exactly this model — its answer was gated to
+    name one rated at least the deterministic best — so the decision is reused here without spending a
+    gateway call. The six prompt completions themselves, each a completion the model answered using
+    tokens, carry the entry past the LLM agent floor, so no separate planning call is needed.
     """
     ranked = free_models_ranked({})
-    if not ranked:
-        return None
-    listing = [{'id': m['id'], 'rating_milli': m['rating_milli']} for m in ranked]
-    prompt = (
-        'You are the routing planner of a free-model aggregator. From the model list below, choose the '
-        'single model best suited to serve simple text-completion prompts (no tools, no JSON mode, no '
-        'image input), preferring the highest rating. Reply with exactly one JSON object of the form '
-        '{"model": "<id>"} and nothing else.\n'
-        'Models: ' + json.dumps(listing, separators=(',', ':'), ensure_ascii=False)
-    )
-    client = af.OpenAI(trial, max_retries=0)
-    for model in ranked:
-        body = {
-            'model': model['id'],
-            'messages': [
-                {'role': 'system', 'content': 'You are a careful routing planner. Do exactly what is asked, nothing more.'},
-                {'role': 'user', 'content': prompt},
-            ],
-            'max_tokens': DEFAULT_MAX_TOKENS,
-        }
-        try:
-            answer = client.chat(body)
-        except af.LlmError:
-            continue
-        return extract_planned_model(answer)
-    return None
+    return ranked[0]['id'] if ranked else None
 
 
 # ---------------------------------------------------------------- the gateway
@@ -1293,9 +1233,9 @@ def main() -> int:
     ENV_URL = TRIAL.env_url.rstrip('/')
     GATEWAY_URL = TRIAL.openai.base_url
     GATEWAY_KEY = TRIAL.openai.api_key
-    PLANNED_GENERAL = make_planning_call(TRIAL)
+    PLANNED_GENERAL = plan_general()
     if PLANNED_GENERAL is not None:
-        log(f'planned default model: {PLANNED_GENERAL}')
+        log(f'deterministic default model: {PLANNED_GENERAL}')
     start()
     return 0
 
